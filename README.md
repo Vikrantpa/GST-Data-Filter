@@ -1,2 +1,4 @@
-# GST-Data-Filter
-This repository contains a ready-to-use Streamlit web application built to automate and simplify city-wise and HSN-wise GST data extraction for business clients.
+# Advanced GST Data Extraction Web Application
+
+Welcome to the GST Data Extraction Web Application, a cutting-edge, Streamlit-powered solution designed to streamline and automate the extraction of Goods and Services Tax (GST) data for business clients. This open-source project empowers businesses to efficiently analyze and manage GST data by city and HSN (Harmonized System of Nomenclature) code, offering unparalleled insights into tax compliance and financial reporting.
+Built with Streamlit, this application combines an intuitive user interface with robust backend processing to deliver a seamless experience. Whether you're a small business owner, a tax consultant, or a large enterprise, this tool simplifies complex GST data workflows, enabling you to extract, visualize, and export city-wise and HSN-wise tax data with ease. The application is designed for scalability, supporting integration with diverse data sources and providing real-time analytics to drive informed decision-making.
