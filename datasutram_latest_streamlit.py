@@ -1,13 +1,53 @@
 import streamlit as st
 import pandas as pd
 import ast
+from pymongo import MongoClient
+from tqdm import tqdm
 
-# --- Load Data from S3 ---
+# -------------------- Mongo Setup ------------------------
+client1 = MongoClient('mongodb://localhost:27017')
+vikrant_db1 = client1.vikrant_db
+shapes_db = vikrant_db1.shape_DB
+shapes2 = shapes_db
+pincode_db = vikrant_db1.pincode_DB
+gst_data = client1.manthan.gst_v11
+
+# -------------------- Utility Functions ------------------------
+
+def get_shapes(location_list):
+    shapes = pd.DataFrame(list(shapes_db.find({
+        'name': {'$in': location_list},
+        'level': {'$in': ['city', 'state']}
+    })))
+    return shapes
+
+def get_pincodeshapes(pincode_list):
+    return pd.DataFrame(pincode_db.find({'name': {'$in': pincode_list}}))
+
+def fetch_gst_data1(final_shapes):
+    gst_list = []
+    if final_shapes.empty:
+        raise ValueError("No shapes found for the selected location(s).")
+
+    for i in tqdm(range(final_shapes.shape[0])):
+        shape = final_shapes.iloc[i]
+        result = list(gst_data.find({
+            'geometry': {'$geoWithin': {'$geometry': shape['geometry']}}
+        }))
+        if result:
+            res = pd.DataFrame(result)
+            res['location'] = shape['name']
+            gst_list.append(res)
+
+    if not gst_list:
+        raise ValueError("No GST data found for the given shapes.")
+
+    return pd.concat(gst_list, ignore_index=True)
+
 @st.cache_data(show_spinner="Loading Pan-India GST Data...")
 def load_pan_india_gst():
     return pd.read_parquet("s3://data-science-ds/find_DB/gst_base11_rv/")
 
-# --- Helper Functions ---
 def convert_to_list(hsn_string):
     try:
         parsed = ast.literal_eval(hsn_string)
@@ -50,7 +90,33 @@ def filter_by_turnover(df, selected_slabs=None):
         df = df[df['turnover_slab'].isin(selected_slabs)]
     return df
 
-# --- Streamlit UI ---
+def saint_gobain_turnoverwise_gst_data(hsn_6_digits, location_list=None, pincode_list=None, level="city", selected_slabs=None):
+    if level == "city":
+        final_shapes = get_shapes(location_list)
+        final_gst_data = fetch_gst_data1(final_shapes)
+    elif level == "pan_india":
+        final_gst_data = load_pan_india_gst()
+    elif level == "pincode":
+        final_shapes = get_pincodeshapes(pincode_list)
+        final_gst_data = fetch_gst_data1(final_shapes)
+    else:
+        raise ValueError("Invalid level. Choose from 'city', 'pan_india', or 'pincode'.")
+
+    if 'pincode_status' in final_gst_data.columns:
+        final_df = final_gst_data[
+            (final_gst_data['status'] == 'Active') &
+            (final_gst_data['pincode_status'].isin(['matched_pincode', 'adjacent_pincode']))]
+    else:
+        final_df = final_gst_data[final_gst_data['status'] == 'Active']
+
+    final_df['goods_hsns'] = final_df['goods_hsns'].apply(convert_to_list)
+    final_df['matched_hsn_code'] = final_df['goods_hsns'].apply(lambda x: check_hsn_in_list(x, hsn_6_digits))
+    filtered_gst = final_df[final_df['matched_hsn_code'].apply(lambda x: len(x) > 0)]
+    filtered_gst = filter_by_turnover(filtered_gst, selected_slabs)
+    return filtered_gst
+
+# -------------------- Streamlit UI ------------------------
+
 st.set_page_config(page_title="GST Data Tool", layout="wide")
 
 col1, col2, col3 = st.columns([1, 8, 3])
@@ -65,118 +131,120 @@ with col3:
 
 st.subheader("📡 Fetching GST Data....")
 
-# --- Load and Pre-filter data ---
-df_raw = load_pan_india_gst()
-df_filtered = df_raw[(df_raw['status'] == 'Active') & (df_raw['pincode_status'].isin(['matched_pincode', 'adjacent_pincode']))]
+with st.form("gst_filter_form"):
+    st.subheader("🔎 Apply Filters")
 
-all_states = sorted(df_filtered['state'].dropna().unique())
-all_business_types = ["Manufacturer", "Trader:Distributor", "Trader: Retailer", "Service Provider"]
+    level = st.selectbox("📍 Select Data Level", ["Shapes", "Pan India"], index=0)
 
-# --- Filters Form ---
-with st.form("gst_input_form"):
-    st.markdown("### 🔍 Apply Filters")
+    location_list = []
+    selected_states = []
+    selected_cities = []
 
-    hsn_input = st.text_input("Enter HSN Code(s) (comma-separated)")
-    hsn_list = [h.strip() for h in hsn_input.split(",") if h.strip()]
+    if level == "Shapes":
+        all_states_raw = shapes2.find({"level": "state", "name": {"$exists": True}})
+        all_states = sorted({doc["name"] for doc in all_states_raw if isinstance(doc["name"], str)})
+        selected_states = st.multiselect("🌐 Select State(s)", all_states)
 
-    selected_states = st.multiselect("Select State(s)", all_states)
+        all_cities_raw = shapes2.find({"level": "city", "name": {"$exists": True}})
+        all_cities = sorted({
+            doc["name"] for doc in all_cities_raw
+            if isinstance(doc.get("name"), str) and not doc["name"].isdigit()
+        })
+        selected_cities = st.multiselect("🏙️ Select City(ies)", all_cities)
 
-    if selected_states:
-        available_cities = df_filtered[df_filtered['state'].isin(selected_states)]['city'].dropna().unique()
-        selected_cities = st.multiselect("Select City(s)", sorted(available_cities))
-    else:
-        selected_cities = []
+        location_list = selected_states + selected_cities
 
-    selected_business_types = st.multiselect("Select Core Nature of Business", all_business_types)
+    hsn_input = st.text_input("📉 Enter HSN Codes (comma-separated)")
+    hsn_6_digits = [hsn.strip() for hsn in hsn_input.split(",") if hsn.strip()]
 
     selected_slabs_ui = st.multiselect(
-        "Select Turnover Slabs",
-        ['Slab: Rs. 0 to 40 lakhs', 'Slab: Rs. 40 lakhs to 1.5 Cr.', 'Slab: Rs. 1.5 Cr. to 5 Cr.',
-         'Slab: Rs. 5 Cr. to 25 Cr.', 'Slab: Rs. 25 Cr. to 100 Cr.', 'Slab: Rs. 100 Cr. to 500 Cr.']
+        "💰 Select Turnover Slabs",
+        ['Slab: Rs. 0 to 40 lakhs', 'Slab: Rs. 40 lakhs to 1.5 Cr.',
+         'Slab: Rs. 1.5 Cr. to 5 Cr.', 'Slab: Rs. 5 Cr. to 25 Cr.',
+         'Slab: Rs. 25 Cr. to 100 Cr.', 'Slab: Rs. 100 Cr. to 500 Cr.']
     )
 
-    submitted = st.form_submit_button("📊 Fetch Filtered Data")
+    business_types = ["Manufacturer", "Trader:Distributor", "Trader: Retailer", "Service Provider"]
+    selected_business_types = st.multiselect("🏢 Select Core Nature of Business", business_types)
 
-# --- Filtering ---
+    submitted = st.form_submit_button("📊 Fetch Data")
+
 if submitted:
-    try:
-        with st.spinner("Filtering data..."):
-            df = df_filtered.copy()
-
-            if selected_states:
-                df = df[df['state'].isin(selected_states)]
-
-            if selected_cities:
-                df = df[df['city'].isin(selected_cities)]
-
-            df['goods_hsns'] = df['goods_hsns'].apply(convert_to_list)
-
-            if hsn_list:
-                df['matched_hsn_code'] = df['goods_hsns'].apply(lambda x: check_hsn_in_list(x, hsn_list))
-                df = df[df['matched_hsn_code'].apply(lambda x: len(x) > 0)]
-            else:
-                df['matched_hsn_code'] = [[] for _ in range(len(df))]
-
-            # Business Type Filter
-            if "core_nature_of_business" in df.columns and "nature_of_business" in df.columns and selected_business_types:
-                keyword_map = {
-                    "Manufacturer": ["Factory / Manufacturing", "Manufacturing"],
-                    "Trader:Distributor": ["Wholesale", "Distributor"],
-                    "Service Provider": ["Services"],
-                    "Trader: Retailer": ["Retail Business"]
-                }
-
-                def business_type_match(row):
-                    if row['core_nature_of_business'] in selected_business_types:
-                        return True
-                    if str(row['core_nature_of_business']).strip() == '#NA':
-                        return any(
-                            any(k.lower() in str(row['nature_of_business']).lower() for k in keyword_map.get(bt, []))
-                            for bt in selected_business_types
-                        )
-                    return False
-
-                df = df[df.apply(business_type_match, axis=1)]
-
-            df = filter_by_turnover(df, selected_slabs_ui)
-
-            total_count = len(df)
-            st.success(f"✅ Total Records Fetched: {total_count}")
-            st.dataframe(df.head(100))
-
-            # --- Chart 1: Turnover-wise Count per City ---
-            st.subheader("📊 Turnover-wise Count Table by City")
-            if 'city' in df.columns and 'turnover_slab' in df.columns:
-                city_pivot = df.pivot_table(index='city', columns='turnover_slab', aggfunc='size', fill_value=0)
-                city_pivot = city_pivot.sort_values(by=city_pivot.columns.tolist(), ascending=False)
-                st.dataframe(city_pivot, use_container_width=True)
-
-            # --- Chart 2: Turnover-wise Count by HSN Code ---
-            st.subheader("📊 Turnover-wise Count Table by HSN Code")
-            hsn_expanded = df.explode('matched_hsn_code')
-            hsn_expanded = hsn_expanded[hsn_expanded['matched_hsn_code'].notna() & (hsn_expanded['matched_hsn_code'] != '')]
-
-            if not hsn_expanded.empty:
-                hsn_pivot = hsn_expanded.pivot_table(index='matched_hsn_code', columns='turnover_slab', aggfunc='size', fill_value=0)
-                hsn_pivot = hsn_pivot.sort_values(by=hsn_pivot.columns.tolist(), ascending=False)
-                st.dataframe(hsn_pivot, use_container_width=True)
-
-            # --- Export Option ---
-            csv_data = df.to_csv(index=False).encode("utf-8")
-
-            if total_count <= st.session_state.available_credits:
-                st.download_button(
-                    label=f"📁 Export {total_count} records (uses credits)",
-                    data=csv_data,
-                    file_name="gst_filtered_export.csv",
-                    mime="text/csv",
-                    key="export_button"
+    if level == "Shapes" and not location_list:
+        st.warning("⚠️ Please select at least one state or city to proceed.")
+    elif not hsn_6_digits:
+        st.warning("⚠️ Please enter at least one HSN code.")
+    else:
+        try:
+            with st.spinner("🔄 Fetching and Processing..."):
+                df = saint_gobain_turnoverwise_gst_data(
+                    hsn_6_digits=hsn_6_digits,
+                    location_list=location_list if level == "Shapes" else None,
+                    level="city" if level == "Shapes" else "pan_india",
+                    selected_slabs=selected_slabs_ui
                 )
-                if st.session_state.get("exported") is not True:
-                    st.session_state.available_credits -= total_count
-                    st.session_state.exported = True
-                    st.success("✅ File is ready for download. Credits deducted.")
-                    st.info(f"💰 Remaining Credits: {st.session_state.available_credits}")
 
-    except Exception as e:
-        st.exception(e)
+                if selected_business_types:
+                    keyword_map = {
+                        "Manufacturer": ["manufactur"],
+                        "Trader:Distributor": ["wholesale", "distributor"],
+                        "Trader: Retailer": ["retail"],
+                        "Service Provider": ["service"]
+                    }
+
+                    def business_match(row):
+                        core = str(row.get("core_nature_of_business", "")).lower()
+                        nature = str(row.get("nature_of_business", "")).lower()
+                        for selected_type in selected_business_types:
+                            keywords = keyword_map.get(selected_type, [])
+                            core_match = any(kw in core for kw in keywords)
+                            nature_match = any(kw in nature for kw in keywords)
+                            if core_match or (core in ["", "#na", "#NA"] and nature_match):
+                                return True
+                        return False
+
+                    df = df[df.apply(business_match, axis=1)]
+
+                st.success(f"✅ Total Records Fetched: {len(df)}")
+                st.dataframe(df.head(100))
+
+                df_exploded = df.explode('matched_hsn_code')
+                df_exploded = df_exploded[df_exploded['matched_hsn_code'].notna()]
+                df_exploded['count'] = 1
+
+                hsn_by_turnover = (
+                    df_exploded
+                    .groupby(['turnover_slab', 'matched_hsn_code'])['count']
+                    .sum()
+                    .reset_index()
+                    .pivot(index='matched_hsn_code', columns='turnover_slab', values='count')
+                    .fillna(0).astype(int)
+                )
+                st.subheader("📊 HSN Code vs Turnover Slab")
+                st.dataframe(hsn_by_turnover, use_container_width=True)
+
+                pivot_col = 'location' if level == "Shapes" else 'city'
+                if pivot_col not in df_exploded.columns and level == "pan_india":
+                    df_exploded[pivot_col] = df.get('city', 'Unknown')
+
+                hsn_by_location = (
+                    df_exploded
+                    .groupby([pivot_col, 'matched_hsn_code'])['count']
+                    .sum()
+                    .reset_index()
+                    .pivot(index='matched_hsn_code', columns=pivot_col, values='count')
+                    .fillna(0).astype(int)
+                )
+                st.subheader(f"📊 HSN Code vs {'Location' if level == 'Shapes' else 'City'}")
+                st.dataframe(hsn_by_location, use_container_width=True)
+
+                csv_data = df.to_csv(index=False).encode("utf-8")
+                if len(df) <= st.session_state.available_credits:
+                    st.download_button("📅 Download CSV", data=csv_data, file_name="gst_filtered.csv", mime="text/csv")
+                    st.session_state.available_credits -= len(df)
+                else:
+                    st.warning("❗ Not enough credits to download data.")
+
+        except Exception as e:
+            st.error("❌ Error fetching data")
+            st.exception(e)
